@@ -182,15 +182,12 @@ function formatDuration(seconds) {
 }
 
 // ---------- Low-latency yt-dlp helpers ----------
-codex/extend-direct-link-handling-with-ytfetchinfo
-const YT_BASE_ARGS = ['--no-playlist', '--force-ipv4']; // avoid slow IPv6 routes
+const YT_BASE_ARGS = ['--force-ipv4']; // avoid slow IPv6 routes
+const YT_STREAM_ARGS = ['--no-playlist', ...YT_BASE_ARGS];
+const YT_METADATA_ARGS = [...YT_BASE_ARGS];
 const YT_INFO_CACHE_TTL_MS = 60_000;
 
 const ytInfoCache = new Map();
-=======
-const YT_STREAM_ARGS   = ['--no-playlist', '--force-ipv4']; // avoid slow IPv6 routes
-const YT_METADATA_ARGS = ['--force-ipv4'];
-main
 
 function resolveBin(nameOrPath) {
   if (!nameOrPath) return nameOrPath;
@@ -268,7 +265,7 @@ async function ytFetchInfo(targetUrl) {
   const cached = ytInfoCacheGet(key);
   if (cached) return cached;
 
-  const args = ['--print', '%(id)s\t%(title)s', '--skip-download', targetUrl, ...YT_BASE_ARGS];
+  const args = [...YT_BASE_ARGS, '--print', '%(id)s\t%(title)s', '--skip-download', targetUrl];
   if (YT_COOKIE) args.unshift('--add-header', `Cookie: ${YT_COOKIE}`);
 
   const promise = new Promise((resolve) => {
@@ -424,15 +421,6 @@ client.on('interactionCreate', async interaction => {
       await connectToUserChannel(interaction, state);
       const query = interaction.options.getString('query', true).trim();
 
-codex/extend-direct-link-handling-with-ytfetchinfo
-      let track;
-      const direct = canonicalWatchUrlFromAny(query);
-      if (direct) {
-        const info = await ytFetchInfo(direct).catch(() => null);
-        const id = info?.id || extractYouTubeId(direct);
-        const title = info?.title || `YouTube Video ${id || ''}`.trim();
-        track = new Track({ title, url: direct, id, requestedBy: interaction.user.tag });
-
       const tracks = await resolveQueryToTracks(query, interaction.user.tag);
       if (!tracks.length) return interaction.editReply('Nothing found.');
 
@@ -440,7 +428,6 @@ codex/extend-direct-link-handling-with-ytfetchinfo
         for (let i = tracks.length - 1; i >= 0; i--) {
           state.queue.unshift(tracks[i]);
         }
-main
       } else {
         state.queue.push(...tracks);
       }
@@ -525,7 +512,7 @@ main
 
 // ---------- yt-dlp search helper ----------
 function ytSearchOne(query) {
-  const args = ['--print', '%(id)s\t%(title)s\t%(duration_string)s', '--skip-download', `ytsearch1:${query}`, ...YT_STREAM_ARGS];
+  const args = [...YT_STREAM_ARGS, '--print', '%(id)s\t%(title)s\t%(duration_string)s', '--skip-download', `ytsearch1:${query}`];
   if (YT_COOKIE) args.unshift('--add-header', `Cookie: ${YT_COOKIE}`);
   return new Promise((resolve, reject) => {
     const p = spawn(resolveBin(YTDLP_PATH), args, { stdio: ['ignore','pipe','pipe'] });
@@ -603,8 +590,10 @@ async function resolveQueryToTracks(query, requestedBy) {
     console.warn('Metadata fetch failed, falling back to basic info:', err.message || err);
   }
 
-  const id = extractYouTubeId(direct);
-  return [new Track({ title: `YouTube Video ${id || ''}`.trim(), url: direct, id, requestedBy })];
+  const info = await ytFetchInfo(direct).catch(() => null);
+  const id = info?.id || extractYouTubeId(direct);
+  const title = info?.title || `YouTube Video ${id || ''}`.trim();
+  return [new Track({ title, url: direct, id, requestedBy })];
 }
 
 // ---------- Dashboard (minimal) ----------
@@ -633,46 +622,33 @@ for (const [ep, tag] of [['/api/play','dashboard'], ['/api/playnext','dashboard-
       const state = ensureGuildState({ guildId: gid, channelId: DEFAULT_TEXT_CHANNEL_ID });
       await connectToChannelById(gid, vcid, state);
 
-codex/extend-direct-link-handling-with-ytfetchinfo
-      let track;
-      const direct = canonicalWatchUrlFromAny(q);
-      if (direct) {
-        const info = await ytFetchInfo(direct).catch(() => null);
-        const id = info?.id || extractYouTubeId(direct);
-        const title = info?.title || `YouTube Video ${id || ''}`.trim();
-        track = new Track({ title, url: direct, id, requestedBy: tag });
-      } else {
-        const found = await ytSearchOne(q);
-        track = new Track({ title: found.title, url: found.url, id: found.id, requestedBy: tag });
-
       const tracks = await resolveQueryToTracks(q, tag);
       if (!tracks.length) return res.status(404).json({ ok:false, error:'Nothing found' });
       if (ep.endsWith('playnext')) {
         for (let i = tracks.length - 1; i >= 0; i--) state.queue.unshift(tracks[i]);
       } else {
         state.queue.push(...tracks);
-main
       }
       if (state.player.state.status !== AudioPlayerStatus.Playing) await playNext(gid);
       res.json({ ok:true, queued: tracks.map(t => ({ title: t.title, url: t.url })) });
     } catch (e) { res.status(500).json({ ok:false, error:String(e.message||e) }); }
   });
 }
-  for (const action of ['skip','stop','pause','resume','leave']) {
-    app.post(`/api/${action}`, (req, res) => {
-      const gid = DEFAULT_GUILD_ID;
-      const state = gid ? queues.get(gid) : null;
-      if (!state) return res.json({ ok: (action==='leave' || action==='stop') });
-      try {
+for (const action of ['skip','stop','pause','resume','leave']) {
+  app.post(`/api/${action}`, (req, res) => {
+    const gid = DEFAULT_GUILD_ID;
+    const state = gid ? queues.get(gid) : null;
+    if (!state) return res.json({ ok: (action==='leave' || action==='stop') });
+    try {
       if (action==='skip')      { if (!state.nowPlaying) return res.json({ ok:false, error:'Nothing is playing.' }); cleanupProcessHandles(state); state.player.stop(true); }
       else if (action==='stop'){ state.queue.length = 0; cleanupProcessHandles(state); state.player.stop(true); }
       else if (action==='pause'){ if (state.player.state.status !== AudioPlayerStatus.Playing) return res.json({ ok:false, error:'Nothing is playing.' }); state.player.pause(); }
       else if (action==='resume'){ if (state.player.state.status !== AudioPlayerStatus.Paused) return res.json({ ok:false, error:'Not paused.' }); state.player.unpause(); }
       else if (action==='leave'){ const conn = getVoiceConnection(gid); if (conn) conn.destroy(); state.queue.length=0; cleanupProcessHandles(state); state.player.stop(true); queues.delete(gid); }
-        res.json({ ok:true });
-      } catch (e) { res.status(500).json({ ok:false, error:String(e.message||e) }); }
-    });
-  }
+      res.json({ ok:true });
+    } catch (e) { res.status(500).json({ ok:false, error:String(e.message||e) }); }
+  });
+}
 app.listen(PORT, () => console.log(`Dashboard: http://localhost:${PORT}`));
 
 // ---------- Boot ----------
