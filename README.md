@@ -19,6 +19,7 @@ npm start
 
 Commands: `/play`, `/playnext`, `/skip`, `/pause`, `/resume`, `/stop`, `/queue`, `/leave`.
 
+codex/add-packaging-tool-and-build-script
 This build includes `@snazzah/davey` so @discordjs/voice v0.19 can negotiate **DAVE** encryption when Discord requires it.
 
 ## Packaged Windows executable
@@ -34,3 +35,12 @@ the executable (or set environment variables globally) before launching.
 
 > **External tools still required**: `yt-dlp.exe` and `ffmpeg.exe` are not bundled by `pkg`. Keep them on your `PATH` or copy
 > them alongside the generated EXE, updating `YTDLP_PATH` / `FFMPEG_PATH` in `.env` if you store them elsewhere.
+=======
+### Highlights
+- Instant title + artwork resolution for **YouTube** and **YouTube Music** links (no more "YouTube Video" placeholders).
+- Full playlist ingestion (YouTube + YouTube Music) with playlist summaries in queue embeds.
+- Reduced playback gap: yt-dlp/ffmpeg child processes are cleaned up aggressively so the next track spins up faster.
+- Works with search terms, direct links, and playlist URLs in both slash commands and the dashboard API.
+
+This build includes `@snazzah/davey` so @discordjs/voice v0.19 can negotiate **DAVE** encryption when Discord requires it.
+main

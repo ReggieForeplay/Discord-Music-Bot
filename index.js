@@ -91,14 +91,39 @@ class Track {
     this.thumbMax = this.id ? `https://i.ytimg.com/vi/${this.id}/maxresdefault.jpg` : null;
   }
 }
+function cleanupProcessHandles(state) {
+  const procs = state?.currentProc;
+  if (!procs) return;
+  for (const key of Object.keys(procs)) {
+    const child = procs[key];
+    if (!child) continue;
+    try { child.kill('SIGKILL'); } catch {}
+  }
+  state.currentProc = null;
+}
+
 function ensureGuildState(guildish) {
   const gid = guildish.guildId;
   let state = queues.get(gid);
   if (!state) {
-    const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
-    player.on(AudioPlayerStatus.Idle, () => playNext(gid).catch(console.error));
-    player.on('error', (e) => { console.error('Player error:', e); playNext(gid).catch(console.error); });
-    state = { player, connection: null, queue: [], nowPlaying: null, voiceChannelId: null, textChannelId: guildish.channelId || DEFAULT_TEXT_CHANNEL_ID || null };
+    state = {
+      player: createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } }),
+      connection: null,
+      queue: [],
+      nowPlaying: null,
+      voiceChannelId: null,
+      textChannelId: guildish.channelId || DEFAULT_TEXT_CHANNEL_ID || null,
+      currentProc: null,
+    };
+    state.player.on(AudioPlayerStatus.Idle, () => {
+      cleanupProcessHandles(state);
+      playNext(gid).catch(console.error);
+    });
+    state.player.on('error', (e) => {
+      console.error('Player error:', e);
+      cleanupProcessHandles(state);
+      playNext(gid).catch(console.error);
+    });
     queues.set(gid, state);
   } else if (!state.textChannelId && (guildish.channelId || DEFAULT_TEXT_CHANNEL_ID)) {
     state.textChannelId = guildish.channelId || DEFAULT_TEXT_CHANNEL_ID;
@@ -145,22 +170,49 @@ function extractYouTubeId(u) {
   return null;
 }
 
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds)) return 'stream';
+  const total = Math.max(0, Math.round(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = h ? String(m).padStart(2, '0') : String(m);
+  const ss = String(s).padStart(2, '0');
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
 // ---------- Low-latency yt-dlp helpers ----------
+codex/extend-direct-link-handling-with-ytfetchinfo
 const YT_BASE_ARGS = ['--no-playlist', '--force-ipv4']; // avoid slow IPv6 routes
+const YT_INFO_CACHE_TTL_MS = 60_000;
+
+const ytInfoCache = new Map();
+=======
+const YT_STREAM_ARGS   = ['--no-playlist', '--force-ipv4']; // avoid slow IPv6 routes
+const YT_METADATA_ARGS = ['--force-ipv4'];
+main
 
 function resolveBin(nameOrPath) {
-  try {
-    // If absolute/relative file exists, use it
-    const abs = path.isAbsolute(nameOrPath) ? nameOrPath : path.join(__dirname, nameOrPath);
-    if (fs.existsSync(abs)) return abs;
-    if (fs.existsSync(nameOrPath)) return nameOrPath;
-  } catch {}
-  // Fallback to PATH
+  if (!nameOrPath) return nameOrPath;
+  if (path.isAbsolute(nameOrPath)) return nameOrPath;
+
+  const candidates = [];
+  if (process.pkg) {
+    candidates.push(path.join(path.dirname(process.execPath), nameOrPath));
+  }
+  candidates.push(path.join(__dirname, nameOrPath));
+  candidates.push(nameOrPath);
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {}
+  }
   return nameOrPath;
 }
 function ytDlSpawnForOpus(input, cookie) {
   const args = [
-    ...YT_BASE_ARGS,
+    ...YT_STREAM_ARGS,
     // prefer Opus at 48k (no ffmpeg), else bestaudio
     '-f', 'bestaudio[acodec^=opus][asr=48000]/bestaudio',
     '-o', '-',
@@ -170,7 +222,7 @@ function ytDlSpawnForOpus(input, cookie) {
   return spawn(resolveBin(YTDLP_PATH), args, { stdio: ['ignore','pipe','pipe'] });
 }
 function ytDlSpawnRaw(input, cookie) {
-  const args = [ ...YT_BASE_ARGS, '-f', 'bestaudio/best', '-o', '-', input ];
+  const args = [ ...YT_STREAM_ARGS, '-f', 'bestaudio/best', '-o', '-', input ];
   if (cookie) args.unshift('--add-header', `Cookie: ${cookie}`);
   return spawn(resolveBin(YTDLP_PATH), args, { stdio: ['ignore','pipe','pipe'] });
 }
@@ -189,6 +241,59 @@ function ffmpegSpawnLowLatency() {
 function ytArgsForQuery(query) {
   const direct = canonicalWatchUrlFromAny(query);
   return direct || `ytsearch1:${query}`;
+}
+
+function ytInfoCacheSetSuccess(key, value) {
+  ytInfoCache.set(key, { value, expires: Date.now() + YT_INFO_CACHE_TTL_MS });
+  return value;
+}
+
+function ytInfoCacheSetPending(key, promise) {
+  ytInfoCache.set(key, { promise });
+  return promise;
+}
+
+function ytInfoCacheGet(key) {
+  const entry = ytInfoCache.get(key);
+  if (!entry) return null;
+  if (entry.value && entry.expires > Date.now()) return entry.value;
+  if (entry.promise) return entry.promise;
+  ytInfoCache.delete(key);
+  return null;
+}
+
+async function ytFetchInfo(targetUrl) {
+  if (!targetUrl) return null;
+  const key = targetUrl;
+  const cached = ytInfoCacheGet(key);
+  if (cached) return cached;
+
+  const args = ['--print', '%(id)s\t%(title)s', '--skip-download', targetUrl, ...YT_BASE_ARGS];
+  if (YT_COOKIE) args.unshift('--add-header', `Cookie: ${YT_COOKIE}`);
+
+  const promise = new Promise((resolve) => {
+    const proc = spawn(resolveBin(YTDLP_PATH), args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    proc.stdout.on('data', d => out += d.toString());
+    proc.stderr.on('data', d => err += d.toString());
+    const finish = (value, shouldCache) => {
+      if (shouldCache) ytInfoCacheSetSuccess(key, value);
+      else ytInfoCache.delete(key);
+      resolve(value);
+    };
+    proc.on('error', () => finish(null, false));
+    proc.on('close', code => {
+      if (code !== 0 || !out.trim()) {
+        if (err.trim()) console.warn('ytFetchInfo failed:', err.trim());
+        return finish(null, false);
+      }
+      const [id, ...titleParts] = out.trim().split('\t');
+      const title = titleParts.join('\t') || 'YouTube Video';
+      finish({ id, title, url: `https://www.youtube.com/watch?v=${id}` }, true);
+    });
+  });
+
+  return ytInfoCacheSetPending(key, promise);
 }
 async function streamDirectOpusOrFallback(input, cookie) {
   // 1) Try direct WebM/Opus (fastest; no ffmpeg)
@@ -210,7 +315,7 @@ async function streamDirectOpusOrFallback(input, cookie) {
   y2.stdout.pipe(f.stdin);
 
   // Return now; @discordjs/voice will read frames as they arrive
-  return { stream: f.stdout, type: undefined, _proc: { y: y2, f } };
+  return { stream: f.stdout, type: StreamType.OggOpus, _proc: { y: y2, f } };
 }
 
 // Warm binaries once to avoid first-spawn lag
@@ -246,23 +351,23 @@ async function connectToChannelById(guildId, channelId, state) {
 async function playNext(guildId) {
   const state = queues.get(guildId);
   if (!state) return;
+  cleanupProcessHandles(state);
   const next = state.queue.shift();
   state.nowPlaying = null;
   if (!next) { try { state.player.stop(true); } catch {} return; }
 
-  console.time('prepareTrack');
   const input = ytArgsForQuery(next.url || next.id || next.title);
-  const { stream, type } = await streamDirectOpusOrFallback(input, YT_COOKIE);
+  const { stream, type, _proc } = await streamDirectOpusOrFallback(input, YT_COOKIE);
   const resource = type
     ? createAudioResource(stream, { inputType: type })
     : await (async () => {
         const probe = await demuxProbe(stream);
         return createAudioResource(probe.stream, { inputType: probe.type });
       })();
-  console.timeEnd('prepareTrack');
 
   state.player.play(resource);
   state.nowPlaying = next;
+  state.currentProc = _proc || null;
   sendNowPlayingEmbed(guildId).catch(console.error);
 }
 
@@ -286,10 +391,13 @@ async function sendNowPlayingEmbed(guildId) {
     .setURL(state.nowPlaying.url)
     .setDescription(state.nowPlaying.title)
     .setImage(max || hq || null)
-    .addFields({ name: 'Requested by', value: state.nowPlaying.requestedBy || 'Unknown', inline: true });
+    .addFields(
+      { name: 'Requested by', value: state.nowPlaying.requestedBy || 'Unknown', inline: true },
+      { name: 'Duration', value: state.nowPlaying.durationRaw || 'stream', inline: true },
+    );
   await channel.send({ embeds: [embed] });
 }
-async function sendQueuedEmbed(channel, track, asNext = false) {
+async function sendQueuedEmbed(channel, track, asNext = false, extraCount = 0) {
   if (!channel?.isTextBased()) return;
   const { hq } = thumbsForUrl(track.url);
   const embed = new EmbedBuilder()
@@ -297,6 +405,10 @@ async function sendQueuedEmbed(channel, track, asNext = false) {
     .setTitle(asNext ? '⏭️ Queued to Play Next' : '➕ Queued')
     .setDescription(`[${track.title}](${track.url})`)
     .setThumbnail(hq || null);
+  const fields = [];
+  if (track.durationRaw) fields.push({ name: 'Duration', value: track.durationRaw, inline: true });
+  if (extraCount > 0) fields.push({ name: 'Playlist', value: `+${extraCount} more track${extraCount === 1 ? '' : 's'}`, inline: true });
+  if (fields.length) embed.addFields(fields);
   await channel.send({ embeds: [embed] });
 }
 
@@ -312,32 +424,42 @@ client.on('interactionCreate', async interaction => {
       await connectToUserChannel(interaction, state);
       const query = interaction.options.getString('query', true).trim();
 
+codex/extend-direct-link-handling-with-ytfetchinfo
       let track;
       const direct = canonicalWatchUrlFromAny(query);
       if (direct) {
-        const id = extractYouTubeId(direct);
-        track = new Track({ title: `YouTube Video ${id || ''}`.trim(), url: direct, id, requestedBy: interaction.user.tag });
+        const info = await ytFetchInfo(direct).catch(() => null);
+        const id = info?.id || extractYouTubeId(direct);
+        const title = info?.title || `YouTube Video ${id || ''}`.trim();
+        track = new Track({ title, url: direct, id, requestedBy: interaction.user.tag });
+
+      const tracks = await resolveQueryToTracks(query, interaction.user.tag);
+      if (!tracks.length) return interaction.editReply('Nothing found.');
+
+      if (interaction.commandName === 'playnext') {
+        for (let i = tracks.length - 1; i >= 0; i--) {
+          state.queue.unshift(tracks[i]);
+        }
+main
       } else {
-        // Use yt-dlp to resolve one result quickly
-        const found = await ytSearchOne(query);
-        track = new Track({ title: found.title, url: found.url, id: found.id, requestedBy: interaction.user.tag });
+        state.queue.push(...tracks);
       }
 
-      if (interaction.commandName === 'playnext') state.queue.unshift(track);
-      else state.queue.push(track);
-
+      const first = tracks[0];
       if (state.player.state.status === AudioPlayerStatus.Playing) {
-        await sendQueuedEmbed(interaction.channel, track, interaction.commandName === 'playnext');
+        await sendQueuedEmbed(interaction.channel, first, interaction.commandName === 'playnext', tracks.length - 1);
       }
       if (state.player.state.status !== AudioPlayerStatus.Playing) await playNext(interaction.guildId);
 
-      return interaction.editReply(`Queued **${track.title}**.`);
+      if (tracks.length === 1) return interaction.editReply(`Queued **${first.title}**.`);
+      return interaction.editReply(`Queued **${tracks.length}** tracks. Starting with **${first.title}**.`);
     }
 
     if (interaction.commandName === 'skip') {
       if (!isDJ(interaction)) return interaction.editReply('Only DJs can skip.');
       const state = queues.get(interaction.guildId);
       if (!state || !state.nowPlaying) return interaction.editReply('Nothing is playing.');
+      cleanupProcessHandles(state);
       state.player.stop(true);
       return interaction.editReply('⏭️ Skipped.');
     }
@@ -347,6 +469,7 @@ client.on('interactionCreate', async interaction => {
       const state = queues.get(interaction.guildId);
       if (!state) return interaction.editReply('Nothing to stop.');
       state.queue.length = 0;
+      cleanupProcessHandles(state);
       state.player.stop(true);
       return interaction.editReply('🛑 Stopped and cleared the queue.');
     }
@@ -369,8 +492,13 @@ client.on('interactionCreate', async interaction => {
 
     if (interaction.commandName === 'queue') {
       const state = queues.get(interaction.guildId) || {};
-      const now = state.nowPlaying ? `**Now:** ${state.nowPlaying.title}` : '*Nothing playing*';
-      const rest = (state.queue || []).slice(0, 10).map((t, i) => `${i+1}. ${t.title}`).join('\n') || '*No upcoming tracks*';
+      const now = state.nowPlaying
+        ? `**Now:** ${state.nowPlaying.title} (${state.nowPlaying.durationRaw || 'stream'})`
+        : '*Nothing playing*';
+      const rest = (state.queue || [])
+        .slice(0, 10)
+        .map((t, i) => `${i + 1}. ${t.title} (${t.durationRaw || 'stream'})`)
+        .join('\n') || '*No upcoming tracks*';
       return interaction.editReply({ embeds: [new EmbedBuilder().setTitle('🎶 Queue').setDescription(`${now}\n\n**Up Next:**\n${rest}`)] });
     }
 
@@ -379,7 +507,12 @@ client.on('interactionCreate', async interaction => {
       const state = queues.get(interaction.guildId);
       const conn = getVoiceConnection(interaction.guildId);
       if (conn) conn.destroy();
-      if (state) { state.queue.length = 0; state.player.stop(true); queues.delete(interaction.guildId); }
+      if (state) {
+        state.queue.length = 0;
+        cleanupProcessHandles(state);
+        state.player.stop(true);
+        queues.delete(interaction.guildId);
+      }
       return interaction.editReply('👋 Disconnected.');
     }
   } catch (err) {
@@ -392,7 +525,7 @@ client.on('interactionCreate', async interaction => {
 
 // ---------- yt-dlp search helper ----------
 function ytSearchOne(query) {
-  const args = ['--print', '%(id)s\t%(title)s', '--skip-download', `ytsearch1:${query}`, ...YT_BASE_ARGS];
+  const args = ['--print', '%(id)s\t%(title)s\t%(duration_string)s', '--skip-download', `ytsearch1:${query}`, ...YT_STREAM_ARGS];
   if (YT_COOKIE) args.unshift('--add-header', `Cookie: ${YT_COOKIE}`);
   return new Promise((resolve, reject) => {
     const p = spawn(resolveBin(YTDLP_PATH), args, { stdio: ['ignore','pipe','pipe'] });
@@ -401,26 +534,93 @@ function ytSearchOne(query) {
     p.stderr.on('data', d => err += d.toString());
     p.on('close', code => {
       if (code !== 0 || !out.trim()) return reject(new Error(err || 'No results'));
-      const [id, ...titleParts] = out.trim().split('\t');
-      const title = titleParts.join('\t') || 'YouTube Video';
-      resolve({ id, title, url: `https://www.youtube.com/watch?v=${id}` });
+      const parts = out.trim().split('\t');
+      const id = parts.shift();
+      const title = (parts.shift() || '').trim() || 'YouTube Video';
+      const durationRaw = (parts.shift() || '').trim();
+      resolve({ id, title, durationRaw, url: `https://www.youtube.com/watch?v=${id}` });
     });
     p.on('error', reject);
   });
 }
 
+function ytFetchMetadata(input) {
+  const args = [...YT_METADATA_ARGS, '--dump-single-json', input];
+  if (YT_COOKIE) args.unshift('--add-header', `Cookie: ${YT_COOKIE}`);
+  return new Promise((resolve, reject) => {
+    const p = spawn(resolveBin(YTDLP_PATH), args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    p.stdout.on('data', d => out += d.toString());
+    p.stderr.on('data', d => err += d.toString());
+    p.on('close', code => {
+      if (code !== 0) return reject(new Error(err || `yt-dlp exited with code ${code}`));
+      try {
+        resolve(JSON.parse(out));
+      } catch (e) {
+        reject(new Error('Failed to parse metadata JSON'));
+      }
+    });
+    p.on('error', reject);
+  });
+}
+
+function trackFromMetadata(entry, requestedBy) {
+  if (!entry) return null;
+  const title = entry.title || entry.track || entry.alt_title || 'YouTube Video';
+  const url = canonicalWatchUrlFromAny(entry.webpage_url || entry.url || entry.original_url || (entry.id ? `https://www.youtube.com/watch?v=${entry.id}` : ''));
+  if (!url) return null;
+  const id = entry.id || extractYouTubeId(url);
+  const durationRaw = entry.duration_string || (Number.isFinite(entry.duration) ? formatDuration(entry.duration) : 'stream');
+  return new Track({ title, url, id, durationRaw, requestedBy });
+}
+
+function collectTracksFromMetadata(meta, requestedBy) {
+  if (!meta) return [];
+  if (Array.isArray(meta.entries) && meta.entries.length) {
+    return meta.entries.flatMap(e => collectTracksFromMetadata(e, requestedBy));
+  }
+  if (Array.isArray(meta.requested_downloads) && meta.requested_downloads.length) {
+    return meta.requested_downloads
+      .map(e => trackFromMetadata(e, requestedBy))
+      .filter(Boolean);
+  }
+  const single = trackFromMetadata(meta, requestedBy);
+  return single ? [single] : [];
+}
+
+async function resolveQueryToTracks(query, requestedBy) {
+  const direct = canonicalWatchUrlFromAny(query);
+  if (!direct) {
+    const found = await ytSearchOne(query);
+    return [new Track({ title: found.title, url: found.url, id: found.id, durationRaw: found.durationRaw || 'stream', requestedBy })];
+  }
+
+  try {
+    const meta = await ytFetchMetadata(direct);
+    const tracks = collectTracksFromMetadata(meta, requestedBy);
+    if (tracks.length) return tracks;
+  } catch (err) {
+    console.warn('Metadata fetch failed, falling back to basic info:', err.message || err);
+  }
+
+  const id = extractYouTubeId(direct);
+  return [new Track({ title: `YouTube Video ${id || ''}`.trim(), url: direct, id, requestedBy })];
+}
+
 // ---------- Dashboard (minimal) ----------
 const app = express();
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 app.get('/api/status', (req, res) => {
   const gid = DEFAULT_GUILD_ID;
   const state = gid ? queues.get(gid) : null;
   const now = state?.nowPlaying ? {
     title: state.nowPlaying.title, url: state.nowPlaying.url, id: state.nowPlaying.id,
+    duration: state.nowPlaying.durationRaw,
     thumb: state.nowPlaying.thumb, thumbMax: state.nowPlaying.thumbMax,
   } : null;
   res.json({ ok: true, guildId: gid || null, voiceChannelId: state?.voiceChannelId || null,
-             nowPlaying: now, queue: (state?.queue || []).map(t => ({ title:t.title, url:t.url, id:t.id, thumb:t.thumb, thumbMax:t.thumbMax })),
+             nowPlaying: now, queue: (state?.queue || []).map(t => ({ title:t.title, url:t.url, id:t.id, duration:t.durationRaw, thumb:t.thumb, thumbMax:t.thumbMax })),
              playerStatus: state?.player?.state?.status || 'idle' });
 });
 for (const [ep, tag] of [['/api/play','dashboard'], ['/api/playnext','dashboard-next']]) {
@@ -433,34 +633,46 @@ for (const [ep, tag] of [['/api/play','dashboard'], ['/api/playnext','dashboard-
       const state = ensureGuildState({ guildId: gid, channelId: DEFAULT_TEXT_CHANNEL_ID });
       await connectToChannelById(gid, vcid, state);
 
+codex/extend-direct-link-handling-with-ytfetchinfo
       let track;
       const direct = canonicalWatchUrlFromAny(q);
-      if (direct) track = new Track({ title: 'YouTube Video', url: direct, requestedBy: tag });
-      else {
+      if (direct) {
+        const info = await ytFetchInfo(direct).catch(() => null);
+        const id = info?.id || extractYouTubeId(direct);
+        const title = info?.title || `YouTube Video ${id || ''}`.trim();
+        track = new Track({ title, url: direct, id, requestedBy: tag });
+      } else {
         const found = await ytSearchOne(q);
         track = new Track({ title: found.title, url: found.url, id: found.id, requestedBy: tag });
+
+      const tracks = await resolveQueryToTracks(q, tag);
+      if (!tracks.length) return res.status(404).json({ ok:false, error:'Nothing found' });
+      if (ep.endsWith('playnext')) {
+        for (let i = tracks.length - 1; i >= 0; i--) state.queue.unshift(tracks[i]);
+      } else {
+        state.queue.push(...tracks);
+main
       }
-      if (ep.endsWith('playnext')) state.queue.unshift(track); else state.queue.push(track);
       if (state.player.state.status !== AudioPlayerStatus.Playing) await playNext(gid);
-      res.json({ ok:true, queued: [{ title: track.title, url: track.url }] });
+      res.json({ ok:true, queued: tracks.map(t => ({ title: t.title, url: t.url })) });
     } catch (e) { res.status(500).json({ ok:false, error:String(e.message||e) }); }
   });
 }
-for (const action of ['skip','stop','pause','resume','leave']) {
-  app.post(`/api/${action}`, (req, res) => {
-    const gid = DEFAULT_GUILD_ID;
-    const state = gid ? queues.get(gid) : null;
-    if (!state) return res.json({ ok: (action==='leave' || action==='stop') });
-    try {
-      if (action==='skip')      { if (!state.nowPlaying) return res.json({ ok:false, error:'Nothing is playing.' }); state.player.stop(true); }
-      else if (action==='stop'){ state.queue.length = 0; state.player.stop(true); }
+  for (const action of ['skip','stop','pause','resume','leave']) {
+    app.post(`/api/${action}`, (req, res) => {
+      const gid = DEFAULT_GUILD_ID;
+      const state = gid ? queues.get(gid) : null;
+      if (!state) return res.json({ ok: (action==='leave' || action==='stop') });
+      try {
+      if (action==='skip')      { if (!state.nowPlaying) return res.json({ ok:false, error:'Nothing is playing.' }); cleanupProcessHandles(state); state.player.stop(true); }
+      else if (action==='stop'){ state.queue.length = 0; cleanupProcessHandles(state); state.player.stop(true); }
       else if (action==='pause'){ if (state.player.state.status !== AudioPlayerStatus.Playing) return res.json({ ok:false, error:'Nothing is playing.' }); state.player.pause(); }
       else if (action==='resume'){ if (state.player.state.status !== AudioPlayerStatus.Paused) return res.json({ ok:false, error:'Not paused.' }); state.player.unpause(); }
-      else if (action==='leave'){ const conn = getVoiceConnection(gid); if (conn) conn.destroy(); state.queue.length=0; state.player.stop(true); queues.delete(gid); }
-      res.json({ ok:true });
-    } catch (e) { res.status(500).json({ ok:false, error:String(e.message||e) }); }
-  });
-}
+      else if (action==='leave'){ const conn = getVoiceConnection(gid); if (conn) conn.destroy(); state.queue.length=0; cleanupProcessHandles(state); state.player.stop(true); queues.delete(gid); }
+        res.json({ ok:true });
+      } catch (e) { res.status(500).json({ ok:false, error:String(e.message||e) }); }
+    });
+  }
 app.listen(PORT, () => console.log(`Dashboard: http://localhost:${PORT}`));
 
 // ---------- Boot ----------

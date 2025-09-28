@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Discord Music Bot Dashboard</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background-color: #121212;
+      color: #f1f1f1;
+    }
+    body {
+      margin: 0;
+      padding: 2rem;
+      background: linear-gradient(135deg, rgba(30,30,30,0.95), rgba(10,10,10,0.95));
+      min-height: 100vh;
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 2rem;
+      text-align: center;
+    }
+    .card {
+      background: rgba(255,255,255,0.08);
+      border-radius: 16px;
+      padding: 1.5rem;
+      margin: 0 auto 1.5rem;
+      max-width: 800px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+      backdrop-filter: blur(12px);
+    }
+    .now-playing {
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+    }
+    .now-playing img {
+      width: 160px;
+      height: 90px;
+      object-fit: cover;
+      border-radius: 12px;
+    }
+    .queue-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .queue-list li {
+      padding: 0.5rem 0;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+    .queue-list li:last-child {
+      border-bottom: none;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 1rem;
+    }
+    button, input[type="text"] {
+      font-size: 1rem;
+      padding: 0.6rem 1rem;
+      border-radius: 999px;
+      border: none;
+    }
+    button {
+      background: #5865f2;
+      color: white;
+      cursor: pointer;
+      transition: transform 0.1s ease, background 0.1s ease;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      background: #4752c4;
+    }
+    button:active {
+      transform: translateY(0);
+    }
+    form.play-form {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 1rem;
+      flex-wrap: wrap;
+    }
+    input[type="text"] {
+      flex: 1;
+      min-width: 200px;
+      background: rgba(0,0,0,0.4);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+    .status-line {
+      font-size: 0.95rem;
+      margin-top: 0.75rem;
+      color: rgba(255,255,255,0.75);
+    }
+    @media (max-width: 600px) {
+      .now-playing {
+        flex-direction: column;
+        text-align: center;
+      }
+      .now-playing img {
+        width: 100%;
+        height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Discord Music Bot Dashboard</h1>
+    <section class="now-playing" id="now-playing">
+      <div>
+        <img id="now-thumb" alt="Now Playing artwork" hidden />
+      </div>
+      <div>
+        <h2 id="now-title">Nothing playing</h2>
+        <p class="status-line" id="player-status">Status: idle</p>
+      </div>
+    </section>
+    <form class="play-form" id="play-form">
+      <input type="text" id="play-input" placeholder="YouTube URL or search terms" required />
+      <div class="controls">
+        <button type="submit">Play</button>
+        <button type="button" id="play-next">Play Next</button>
+      </div>
+    </form>
+    <div class="controls" id="transport-controls">
+      <button data-action="skip">Skip</button>
+      <button data-action="pause">Pause</button>
+      <button data-action="resume">Resume</button>
+      <button data-action="stop">Stop</button>
+      <button data-action="leave">Leave</button>
+    </div>
+    <section>
+      <h3>Queue</h3>
+      <ul class="queue-list" id="queue"></ul>
+    </section>
+    <p class="status-line" id="message" role="alert"></p>
+  </div>
+  <script>
+    const statusEl = document.getElementById('player-status');
+    const nowTitle = document.getElementById('now-title');
+    const nowThumb = document.getElementById('now-thumb');
+    const queueList = document.getElementById('queue');
+    const messageEl = document.getElementById('message');
+    const playForm = document.getElementById('play-form');
+    const playInput = document.getElementById('play-input');
+    const playNextBtn = document.getElementById('play-next');
+    const controls = document.getElementById('transport-controls');
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/api/status');
+        if (!res.ok) throw new Error('Failed to fetch status');
+        const data = await res.json();
+        updateUI(data);
+      } catch (err) {
+        showMessage(err.message || String(err), true);
+      }
+    }
+
+    function updateUI(data) {
+      const status = data.playerStatus || 'idle';
+      statusEl.textContent = `Status: ${status}`;
+      if (data.nowPlaying) {
+        nowTitle.innerHTML = `<a href="${data.nowPlaying.url}" target="_blank" rel="noopener">${data.nowPlaying.title}</a>`;
+        if (data.nowPlaying.thumbMax || data.nowPlaying.thumb) {
+          nowThumb.src = data.nowPlaying.thumbMax || data.nowPlaying.thumb;
+          nowThumb.hidden = false;
+        } else {
+          nowThumb.hidden = true;
+        }
+      } else {
+        nowTitle.textContent = 'Nothing playing';
+        nowThumb.hidden = true;
+      }
+      queueList.innerHTML = '';
+      (data.queue || []).forEach((item, index) => {
+        const li = document.createElement('li');
+        li.innerHTML = `<strong>${index + 1}.</strong> <a href="${item.url}" target="_blank" rel="noopener">${item.title}</a>`;
+        queueList.appendChild(li);
+      });
+      if (!data.queue || data.queue.length === 0) {
+        const empty = document.createElement('li');
+        empty.textContent = 'Queue is empty';
+        empty.style.opacity = '0.7';
+        queueList.appendChild(empty);
+      }
+    }
+
+    function showMessage(msg, isError = false) {
+      messageEl.textContent = msg;
+      messageEl.style.color = isError ? '#ff6b6b' : 'rgba(255,255,255,0.85)';
+      if (msg) {
+        setTimeout(() => {
+          if (messageEl.textContent === msg) {
+            messageEl.textContent = '';
+          }
+        }, 5000);
+      }
+    }
+
+    async function postJSON(endpoint, body = {}) {
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.ok === false) {
+          throw new Error(data.error || `Request failed: ${res.status}`);
+        }
+        await fetchStatus();
+        showMessage(data.message || 'Success');
+      } catch (err) {
+        showMessage(err.message || String(err), true);
+      }
+    }
+
+    playForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const query = playInput.value.trim();
+      if (!query) return;
+      await postJSON('/api/play', { query });
+      playInput.value = '';
+    });
+
+    playNextBtn.addEventListener('click', async () => {
+      const query = playInput.value.trim();
+      if (!query) {
+        showMessage('Enter a song to queue next.', true);
+        return;
+      }
+      await postJSON('/api/playnext', { query });
+      playInput.value = '';
+    });
+
+    controls.addEventListener('click', async (event) => {
+      if (event.target.tagName !== 'BUTTON') return;
+      const action = event.target.dataset.action;
+      if (!action) return;
+      await postJSON(`/api/${action}`);
+    });
+
+    fetchStatus();
+    setInterval(fetchStatus, 5000);
+  </script>
+</body>
+</html>
