@@ -170,6 +170,17 @@ function extractYouTubeId(u) {
   return null;
 }
 
+function isYouTubePlaylistUrl(u) {
+  try {
+    const url = new URL(u);
+    if (!url.hostname.includes('youtube.com') && !url.hostname.includes('youtu.be')) return false;
+    if (url.pathname === '/playlist') return true;
+    if (url.searchParams.has('list') && !url.searchParams.has('v')) return true;
+    return false;
+  } catch {}
+  return false;
+}
+
 function formatDuration(seconds) {
   if (!Number.isFinite(seconds)) return 'stream';
   const total = Math.max(0, Math.round(seconds));
@@ -184,7 +195,7 @@ function formatDuration(seconds) {
 // ---------- Low-latency yt-dlp helpers ----------
 const YT_BASE_ARGS = ['--force-ipv4']; // avoid slow IPv6 routes
 const YT_STREAM_ARGS = ['--no-playlist', ...YT_BASE_ARGS];
-const YT_METADATA_ARGS = [...YT_BASE_ARGS];
+const YT_METADATA_ARGS = ['--skip-download', ...YT_BASE_ARGS];
 const YT_INFO_CACHE_TTL_MS = 60_000;
 
 const ytInfoCache = new Map();
@@ -259,13 +270,15 @@ function ytInfoCacheGet(key) {
   return null;
 }
 
-async function ytFetchInfo(targetUrl) {
+async function ytFetchInfo(targetUrl, { allowPlaylist = true } = {}) {
   if (!targetUrl) return null;
   const key = targetUrl;
   const cached = ytInfoCacheGet(key);
   if (cached) return cached;
 
-  const args = [...YT_BASE_ARGS, '--print', '%(id)s\t%(title)s', '--skip-download', targetUrl];
+  const args = [...YT_BASE_ARGS, '--print', '%(id)s\t%(title)s', '--skip-download'];
+  if (!allowPlaylist) args.push('--no-playlist');
+  args.push(targetUrl);
   if (YT_COOKIE) args.unshift('--add-header', `Cookie: ${YT_COOKIE}`);
 
   const promise = new Promise((resolve) => {
@@ -531,8 +544,10 @@ function ytSearchOne(query) {
   });
 }
 
-function ytFetchMetadata(input) {
-  const args = [...YT_METADATA_ARGS, '--dump-single-json', input];
+function ytFetchMetadata(input, { allowPlaylist = true } = {}) {
+  const args = [...YT_METADATA_ARGS];
+  if (!allowPlaylist) args.push('--no-playlist');
+  args.push('--dump-single-json', input);
   if (YT_COOKIE) args.unshift('--add-header', `Cookie: ${YT_COOKIE}`);
   return new Promise((resolve, reject) => {
     const p = spawn(resolveBin(YTDLP_PATH), args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -582,15 +597,16 @@ async function resolveQueryToTracks(query, requestedBy) {
     return [new Track({ title: found.title, url: found.url, id: found.id, durationRaw: found.durationRaw || 'stream', requestedBy })];
   }
 
+  const allowPlaylist = isYouTubePlaylistUrl(direct);
   try {
-    const meta = await ytFetchMetadata(direct);
+    const meta = await ytFetchMetadata(direct, { allowPlaylist });
     const tracks = collectTracksFromMetadata(meta, requestedBy);
     if (tracks.length) return tracks;
   } catch (err) {
     console.warn('Metadata fetch failed, falling back to basic info:', err.message || err);
   }
 
-  const info = await ytFetchInfo(direct).catch(() => null);
+  const info = await ytFetchInfo(direct, { allowPlaylist }).catch(() => null);
   const id = info?.id || extractYouTubeId(direct);
   const title = info?.title || `YouTube Video ${id || ''}`.trim();
   return [new Track({ title, url: direct, id, requestedBy })];
