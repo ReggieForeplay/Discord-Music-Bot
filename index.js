@@ -147,6 +147,9 @@ function extractYouTubeId(u) {
 
 // ---------- Low-latency yt-dlp helpers ----------
 const YT_BASE_ARGS = ['--no-playlist', '--force-ipv4']; // avoid slow IPv6 routes
+const YT_INFO_CACHE_TTL_MS = 60_000;
+
+const ytInfoCache = new Map();
 
 function resolveBin(nameOrPath) {
   try {
@@ -189,6 +192,59 @@ function ffmpegSpawnLowLatency() {
 function ytArgsForQuery(query) {
   const direct = canonicalWatchUrlFromAny(query);
   return direct || `ytsearch1:${query}`;
+}
+
+function ytInfoCacheSetSuccess(key, value) {
+  ytInfoCache.set(key, { value, expires: Date.now() + YT_INFO_CACHE_TTL_MS });
+  return value;
+}
+
+function ytInfoCacheSetPending(key, promise) {
+  ytInfoCache.set(key, { promise });
+  return promise;
+}
+
+function ytInfoCacheGet(key) {
+  const entry = ytInfoCache.get(key);
+  if (!entry) return null;
+  if (entry.value && entry.expires > Date.now()) return entry.value;
+  if (entry.promise) return entry.promise;
+  ytInfoCache.delete(key);
+  return null;
+}
+
+async function ytFetchInfo(targetUrl) {
+  if (!targetUrl) return null;
+  const key = targetUrl;
+  const cached = ytInfoCacheGet(key);
+  if (cached) return cached;
+
+  const args = ['--print', '%(id)s\t%(title)s', '--skip-download', targetUrl, ...YT_BASE_ARGS];
+  if (YT_COOKIE) args.unshift('--add-header', `Cookie: ${YT_COOKIE}`);
+
+  const promise = new Promise((resolve) => {
+    const proc = spawn(resolveBin(YTDLP_PATH), args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    proc.stdout.on('data', d => out += d.toString());
+    proc.stderr.on('data', d => err += d.toString());
+    const finish = (value, shouldCache) => {
+      if (shouldCache) ytInfoCacheSetSuccess(key, value);
+      else ytInfoCache.delete(key);
+      resolve(value);
+    };
+    proc.on('error', () => finish(null, false));
+    proc.on('close', code => {
+      if (code !== 0 || !out.trim()) {
+        if (err.trim()) console.warn('ytFetchInfo failed:', err.trim());
+        return finish(null, false);
+      }
+      const [id, ...titleParts] = out.trim().split('\t');
+      const title = titleParts.join('\t') || 'YouTube Video';
+      finish({ id, title, url: `https://www.youtube.com/watch?v=${id}` }, true);
+    });
+  });
+
+  return ytInfoCacheSetPending(key, promise);
 }
 async function streamDirectOpusOrFallback(input, cookie) {
   // 1) Try direct WebM/Opus (fastest; no ffmpeg)
@@ -315,8 +371,10 @@ client.on('interactionCreate', async interaction => {
       let track;
       const direct = canonicalWatchUrlFromAny(query);
       if (direct) {
-        const id = extractYouTubeId(direct);
-        track = new Track({ title: `YouTube Video ${id || ''}`.trim(), url: direct, id, requestedBy: interaction.user.tag });
+        const info = await ytFetchInfo(direct).catch(() => null);
+        const id = info?.id || extractYouTubeId(direct);
+        const title = info?.title || `YouTube Video ${id || ''}`.trim();
+        track = new Track({ title, url: direct, id, requestedBy: interaction.user.tag });
       } else {
         // Use yt-dlp to resolve one result quickly
         const found = await ytSearchOne(query);
@@ -435,8 +493,12 @@ for (const [ep, tag] of [['/api/play','dashboard'], ['/api/playnext','dashboard-
 
       let track;
       const direct = canonicalWatchUrlFromAny(q);
-      if (direct) track = new Track({ title: 'YouTube Video', url: direct, requestedBy: tag });
-      else {
+      if (direct) {
+        const info = await ytFetchInfo(direct).catch(() => null);
+        const id = info?.id || extractYouTubeId(direct);
+        const title = info?.title || `YouTube Video ${id || ''}`.trim();
+        track = new Track({ title, url: direct, id, requestedBy: tag });
+      } else {
         const found = await ytSearchOne(q);
         track = new Track({ title: found.title, url: found.url, id: found.id, requestedBy: tag });
       }
